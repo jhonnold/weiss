@@ -505,8 +505,8 @@ static void ComputeGradient(TEntry *entries, TVector gradient, TVector params, d
     #pragma omp parallel shared(gradient)
     {
         TVector local = {0};
-        #pragma omp for schedule(static, NPOSITIONS / NPARTITIONS)
-        for (int i = 0; i < NPOSITIONS; i++)
+        #pragma omp for schedule(static, BATCHSIZE / NPARTITIONS)
+        for (int i = 0; i < BATCHSIZE; i++)
             UpdateSingleGradient(&entries[i], local, params, K);
 
         for (int i = 0; i < NTERMS; i++) {
@@ -530,6 +530,19 @@ static double TunedEvaluationErrors(TEntry *entries, TVector params, double K) {
     return total / (double) NPOSITIONS;
 }
 
+// static double BatchTunedEvaluationErrors(TEntry *entries, TVector params, double K) {
+//     double total = 0.0;
+
+//     #pragma omp parallel shared(total)
+//     {
+//         #pragma omp for schedule(static, BATCHSIZE / NPARTITIONS) reduction(+:total)
+//         for (int i = 0; i < BATCHSIZE; i++)
+//             total += pow(entries[i].result - Sigmoid(K, LinearEvaluation(&entries[i], params, entries[i].eval)), 2);
+//     }
+
+//     return total / (double) BATCHSIZE; 
+// }
+
 void Tune() {
 
     TVector baseParams = {0}, params = {0}, momentum = {0}, velocity = {0};
@@ -546,29 +559,30 @@ void Tune() {
     printf("Optimal K: %g\n\n", K);
 
     for (int epoch = 1; epoch <= MAXEPOCHS; epoch++) {
+        for (int batch = 0; batch < NPOSITIONS / BATCHSIZE; batch++) {
+            TVector gradient = {0};
+            ComputeGradient(&entries[batch * BATCHSIZE], gradient, params, K);
 
-        TVector gradient = {0};
-        ComputeGradient(entries, gradient, params, K);
+            for (int i = 0; i < NTERMS; i++) {
+                double mg_grad = gradient[i][MG] / BATCHSIZE;
+                double eg_grad = gradient[i][EG] / BATCHSIZE;
 
-        for (int i = 0; i < NTERMS; i++) {
-            double mg_grad = (-K / 200.0) * gradient[i][MG] / NPOSITIONS;
-            double eg_grad = (-K / 200.0) * gradient[i][EG] / NPOSITIONS;
+                momentum[i][MG] = BETA_1 * momentum[i][MG] + (1.0 - BETA_1) * mg_grad;
+                momentum[i][EG] = BETA_1 * momentum[i][EG] + (1.0 - BETA_1) * eg_grad;
 
-            momentum[i][MG] = BETA_1 * momentum[i][MG] + (1.0 - BETA_1) * mg_grad;
-            momentum[i][EG] = BETA_1 * momentum[i][EG] + (1.0 - BETA_1) * eg_grad;
+                velocity[i][MG] = BETA_2 * velocity[i][MG] + (1.0 - BETA_2) * pow(mg_grad, 2);
+                velocity[i][EG] = BETA_2 * velocity[i][EG] + (1.0 - BETA_2) * pow(eg_grad, 2);
 
-            velocity[i][MG] = BETA_2 * velocity[i][MG] + (1.0 - BETA_2) * pow(mg_grad, 2);
-            velocity[i][EG] = BETA_2 * velocity[i][EG] + (1.0 - BETA_2) * pow(eg_grad, 2);
-
-            params[i][MG] -= rate * momentum[i][MG] / (1e-8 + sqrt(velocity[i][MG]));
-            params[i][EG] -= rate * momentum[i][EG] / (1e-8 + sqrt(velocity[i][EG]));
+                params[i][MG] += rate * momentum[i][MG] / (1e-8 + sqrt(velocity[i][MG]));
+                params[i][EG] += rate * momentum[i][EG] / (1e-8 + sqrt(velocity[i][EG]));
+            }
         }
 
         error = TunedEvaluationErrors(entries, params, K);
         printf("\rEpoch [%d] Error = [%.8f], Rate = [%g]", epoch, error, rate);
         if (epoch % 10 == 0) puts("");
 
-        // Pre-scheduled Learning Rate drops
+        // // Pre-scheduled Learning Rate drops
         if (epoch % LRSTEPRATE == 0) rate = rate / LRDROPRATE;
         if (epoch % REPORTING == 0) PrintParameters(params, baseParams);
     }
